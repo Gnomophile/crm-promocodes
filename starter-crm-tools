@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Starter CRM — массовое вкл/выкл промокодов
 // @namespace    starter-crm-tools
-// @version      1.2.0
+// @version      1.2.1
 // @description  Массовое отключение промокодов с логом и обратное включение (по логу или все неархивные)
 // @match        https://crm.starterapp.ru/*/admin/*
 // @updateURL    https://raw.githubusercontent.com/Gnomophile/crm-promocodes/main/starter-crm-tools
@@ -148,7 +148,7 @@
     ensureStyle();
     const b = el(`<button id="pmt-open" type="button" class="btn bg-grey bg-grey_border me-2">
       <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="me-2"><path d="M13 3l0 7l6 0l-8 11l0 -7l-6 0l8 -11"/></svg>
-      Массово промокоды</button>`);
+      Общее управление</button>`);
     b.addEventListener('click', openModal);
     history.parentElement.insertBefore(b, history);
   }
