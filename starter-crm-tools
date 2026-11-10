@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Starter CRM — массовое вкл/выкл промокодов
 // @namespace    starter-crm-tools
-// @version      1.2.1
+// @version      1.4.0
 // @description  Массовое отключение промокодов с логом и обратное включение (по логу или все неархивные)
 // @match        https://crm.starterapp.ru/*/admin/*
 // @updateURL    https://raw.githubusercontent.com/Gnomophile/crm-promocodes/main/starter-crm-tools
@@ -22,10 +22,33 @@
   const onPromoPage = () => /\/admin\/marketing\/promotions/.test(location.pathname);
 
   // ---------- API ----------
+  // Сессия CRM короткая: когда она истекает, сервер отвечает 401, и CRM сама продлевает её
+  // через POST /refresh. Скрипт делает то же самое, иначе длинный прогон обрывается на середине.
+  class AuthError extends Error {}
+  let refreshing = null;
+  function refreshSession() {
+    if (!refreshing) {
+      refreshing = fetch(`/${project()}/api/v1/frontend/refresh`, { method: 'POST', credentials: 'include', headers: { Accept: 'application/json' } })
+        .then((r) => r.ok)
+        .catch(() => false)
+        .finally(() => { setTimeout(() => { refreshing = null; }, 2000); });
+    }
+    return refreshing;
+  }
+  async function apiFetch(url, opts = {}) {
+    let r = await fetch(url, { credentials: 'include', ...opts });
+    if (r.status === 401) {
+      if (!(await refreshSession())) throw new AuthError('Сессия CRM истекла — войди заново и запусти ещё раз');
+      r = await fetch(url, { credentials: 'include', ...opts });
+      if (r.status === 401) throw new AuthError('Сессия CRM истекла — войди заново и запусти ещё раз');
+    }
+    return r;
+  }
+
   async function fetchAll() {
     const all = [];
     for (let offset = 0; ; offset += 100) {
-      const r = await fetch(api(`/promocodes?offset=${offset}&limit=100`), { credentials: 'include' });
+      const r = await apiFetch(api(`/promocodes?offset=${offset}&limit=100`));
       if (!r.ok) throw new Error(`Список промокодов: HTTP ${r.status}`);
       const j = await r.json();
       all.push(...j.items);
@@ -36,9 +59,8 @@
 
   async function setStatus(id, status) {
     for (let attempt = 0; attempt < 3; attempt++) {
-      const r = await fetch(api(`/promocodes/${id}/status`), {
+      const r = await apiFetch(api(`/promocodes/${id}/status`), {
         method: 'PATCH',
-        credentials: 'include',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({ status }),
       });
@@ -183,7 +205,7 @@
 
             <div class="pmt-card">
               <h3>Включить обратно по логу</h3>
-              <p>Включит только промокоды из выбранного лога, которые сейчас неактивны. Архивные и уже активные пропускаются.</p>
+              <p>Включит промокоды из выбранного лога. Архивные пропускаются.</p>
               <div class="pmt-logs" id="pmt-logs"></div>
               <div class="pmt-row">
                 <button class="pmt-btn sm" id="pmt-import">Загрузить лог из файла</button>
@@ -288,9 +310,9 @@
     if (run) run.style.display = '';
     if (errBox) errBox.textContent = '';
     const ok = []; const failed = [];
-    let done = 0; let idx = 0;
+    let done = 0; let idx = 0; let authLost = false;
     const update = () => {
-      if (st) st.textContent = `${label}: ${done} из ${items.length} (ошибок: ${failed.length})${stopRequested ? ' — останавливаюсь…' : ''}`;
+      if (st) st.textContent = `${label}: обработано ${done} из ${items.length} — успешно ${ok.length}, ошибок ${failed.length}${stopRequested ? ' — останавливаюсь…' : ''}`;
       if (bar) bar.style.transform = `scaleX(${items.length ? done / items.length : 1})`;
     };
     update();
@@ -298,16 +320,26 @@
       while (idx < items.length && !stopRequested) {
         const it = items[idx++];
         try { await setStatus(it.id, status); ok.push(it); if (onOk) onOk(it); } catch (e) {
+          if (e instanceof AuthError) {
+            // без сессии все остальные запросы тоже упадут — останавливаемся, а не «проходим» список вхолостую
+            authLost = true; stopRequested = true;
+            break;
+          }
           failed.push({ ...it, error: e.message });
-          if (errBox) errBox.textContent += `${it.code}: ${e.message}\n`;
+          if (errBox) errBox.textContent += `${it.code || it.name}: ${e.message}\n`;
         }
         done++; update();
       }
     };
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-    if (st) st.textContent = `${label}: готово ${ok.length} из ${items.length}${failed.length ? `, ошибок ${failed.length}` : ''}${stopRequested ? ' (остановлено)' : ''}.`;
+    if (st) st.textContent = `${label}: успешно ${ok.length} из ${items.length}${failed.length ? `, ошибок ${failed.length}` : ''}${stopRequested ? ' (остановлено)' : ''}. `
+      + 'CRM применяет изменения в фоне: при сотнях промокодов статусы в списке и счётчики догоняют за несколько минут. Повторно запускать не нужно.';
     busy = false;
     setButtonsDisabled(false);
+    if (authLost) {
+      const left = items.length - ok.length - failed.length;
+      alert(`Сессия CRM истекла, процесс остановлен. Успешно: ${ok.length}, не обработано: ${left}.\nОбнови страницу (при необходимости войди заново) и запусти действие ещё раз.`);
+    }
     return { ok, failed, stopped: stopRequested };
   }
 
@@ -339,15 +371,17 @@
     if (busy) return;
     await refreshStats();
     const byId = new Map((cache || []).map((x) => [x.id, x]));
-    const targets = []; let skippedActive = 0; let skippedArchived = 0; let missing = 0;
+    // «Активные» НЕ пропускаем: после массового выключения CRM применяет статусы в фоне с задержкой,
+    // и в списке промокод может ещё числиться активным, а потом всё равно выключиться.
+    // Повторное включение уже активного безвредно.
+    const targets = []; let skippedArchived = 0; let missing = 0;
     log.items.forEach((it) => {
       const cur = byId.get(it.id);
       if (!cur) missing++;
-      else if (cur.status === 'active') skippedActive++;
       else if (cur.status === 'archived') skippedArchived++;
       else targets.push(brief(cur));
     });
-    const notes = [skippedActive && `уже активны: ${skippedActive}`, skippedArchived && `в архиве: ${skippedArchived}`, missing && `не найдены: ${missing}`].filter(Boolean).join(', ');
+    const notes = [skippedArchived && `в архиве: ${skippedArchived}`, missing && `не найдены: ${missing}`].filter(Boolean).join(', ');
     if (!targets.length) { alert(`Включать нечего${notes ? ` (${notes})` : ''}.`); return; }
     if (!confirm(`Включить ${targets.length} промокодов из лога от ${fmtDate(log.ts)}?${notes ? `\nПропущено — ${notes}.` : ''}`)) return;
     const res = await runBatch(targets, 'active', 'Включение по логу');
