@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Starter CRM — массовое вкл/выкл промокодов
 // @namespace    starter-crm-tools
-// @version      1.1.0
+// @version      1.2.0
 // @description  Массовое отключение промокодов с логом и обратное включение (по логу или все неархивные)
 // @match        https://crm.starterapp.ru/*/admin/*
+// @updateURL    https://raw.githubusercontent.com/Gnomophile/crm-promocodes/main/starter-crm-tools
+// @downloadURL  https://raw.githubusercontent.com/Gnomophile/crm-promocodes/main/starter-crm-tools
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-idle
