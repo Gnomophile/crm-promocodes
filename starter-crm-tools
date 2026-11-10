@@ -1,0 +1,375 @@
+// ==UserScript==
+// @name         Starter CRM — массовое вкл/выкл промокодов
+// @namespace    starter-crm-tools
+// @version      1.1.0
+// @description  Массовое отключение промокодов с логом и обратное включение (по логу или все неархивные)
+// @match        https://crm.starterapp.ru/*/admin/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const CONCURRENCY = 4;
+  const STORE_KEY = 'pmt_logs_v1';
+
+  const project = () => location.pathname.split('/')[1];
+  const api = (p) => `/${project()}/api/v1/frontend/promotions${p}`;
+  const onPromoPage = () => /\/admin\/marketing\/promotions/.test(location.pathname);
+
+  // ---------- API ----------
+  async function fetchAll() {
+    const all = [];
+    for (let offset = 0; ; offset += 100) {
+      const r = await fetch(api(`/promocodes?offset=${offset}&limit=100`), { credentials: 'include' });
+      if (!r.ok) throw new Error(`Список промокодов: HTTP ${r.status}`);
+      const j = await r.json();
+      all.push(...j.items);
+      if (j.items.length < 100 || all.length >= j.total) break;
+    }
+    return all;
+  }
+
+  async function setStatus(id, status) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = await fetch(api(`/promocodes/${id}/status`), {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      if (r.ok) return;
+      if (r.status !== 429 && r.status < 500) {
+        let msg = '';
+        try { msg = (await r.text()).slice(0, 200); } catch (e) { /* ignore */ }
+        throw new Error(`HTTP ${r.status} ${msg}`);
+      }
+      await new Promise((res) => setTimeout(res, 1000 * (attempt + 1)));
+    }
+    throw new Error('сервер не ответил после 3 попыток');
+  }
+
+  // ---------- Логи ----------
+  const loadLogs = () => { try { return JSON.parse(GM_getValue(STORE_KEY, '[]')); } catch (e) { return []; } };
+  const saveLogs = (logs) => GM_setValue(STORE_KEY, JSON.stringify(logs));
+  const projectLogs = () => loadLogs().filter((l) => l.project === project()).sort((a, b) => b.ts - a.ts);
+
+  function downloadJson(obj, name) {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }
+  const fmtDate = (ts) => new Date(ts).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const fileStamp = (ts) => new Date(ts).toISOString().slice(0, 16).replace(/[:T]/g, '-');
+
+  // ---------- Стили ----------
+  const STYLE = `
+  #pmt-overlay, #pmt-overlay * { box-sizing: border-box; }
+  #pmt-overlay button { margin: 0; padding: 0; font: inherit; color: inherit; cursor: pointer; }
+  #pmt-overlay {
+    --pmt-accent: #bd5b34; --pmt-accent-hover: #9c4a29;
+    --pmt-bg-page: #fbf9f5; --pmt-bg-panel: #fffdfa; --pmt-bg-subtle: #f2ede2;
+    --pmt-border: #e6dfd0; --pmt-text: #2b2620; --pmt-text2: #857e6f; --pmt-text3: #a89f8c;
+    --pmt-ok: #2f7d4f; --pmt-err: #b3261e;
+    position: fixed; inset: 0; background: rgba(23,20,14,.5); z-index: 999999;
+    display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px; color: var(--pmt-text);
+  }
+  #pmt-modal { background: var(--pmt-bg-page); width: min(640px, 96vw); max-height: 88vh; border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.3); display: flex; flex-direction: column; overflow: hidden; }
+  #pmt-header { display: flex; align-items: center; gap: 12px; padding: 14px 18px; background: var(--pmt-bg-panel);
+    border-bottom: 1px solid var(--pmt-border); }
+  #pmt-header h2 { font-size: 16px; margin: 0; flex: 1; }
+  #pmt-close { width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--pmt-border) !important;
+    background: var(--pmt-bg-panel); display: flex; align-items: center; justify-content: center; color: var(--pmt-text2) !important; }
+  #pmt-close:hover { background: var(--pmt-bg-subtle); }
+  #pmt-body { overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 14px; }
+  .pmt-stats { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pmt-stat { flex: 1; min-width: 120px; background: var(--pmt-bg-panel); border: 1px solid var(--pmt-border);
+    border-radius: 10px; padding: 10px 12px; }
+  .pmt-stat b { display: block; font-size: 20px; }
+  .pmt-stat span { color: var(--pmt-text2); font-size: 12px; }
+  .pmt-card { background: var(--pmt-bg-panel); border: 1px solid var(--pmt-border); border-radius: 10px; padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 8px; }
+  .pmt-card h3 { margin: 0; font-size: 14px; }
+  .pmt-card p { margin: 0; color: var(--pmt-text2); font-size: 13px; line-height: 1.5; }
+  .pmt-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .pmt-btn { padding: 8px 14px !important; border-radius: 8px; border: 1px solid var(--pmt-border) !important;
+    background: var(--pmt-bg-panel); font-size: 13px !important; }
+  .pmt-btn:hover:not(:disabled) { background: var(--pmt-bg-subtle); }
+  .pmt-btn.primary { background: var(--pmt-accent); border-color: var(--pmt-accent) !important; color: #fff !important; }
+  .pmt-btn.primary:hover:not(:disabled) { background: var(--pmt-accent-hover); }
+  .pmt-btn.danger { color: var(--pmt-err) !important; border-color: #e7b9b5 !important; }
+  .pmt-btn:disabled { opacity: .5; cursor: default; }
+  .pmt-btn.sm { padding: 4px 10px !important; font-size: 12px !important; }
+  .pmt-logs { display: flex; flex-direction: column; gap: 6px; }
+  .pmt-log { display: flex; gap: 8px; align-items: center; padding: 8px 10px; border: 1px solid var(--pmt-border);
+    border-radius: 8px; background: var(--pmt-bg-page); }
+  .pmt-log .info { flex: 1; font-size: 13px; }
+  .pmt-log .info small { display: block; color: var(--pmt-text3); font-size: 12px; }
+  .pmt-progress { height: 8px; background: var(--pmt-bg-subtle); border-radius: 4px; overflow: hidden; }
+  .pmt-progress div { height: 100%; width: 100%; background: var(--pmt-accent); transform-origin: left; transform: scaleX(0); transition: transform .2s; }
+  .pmt-status { font-size: 13px; color: var(--pmt-text2); }
+  .pmt-errors { font-size: 12px; color: var(--pmt-err); max-height: 140px; overflow: auto; white-space: pre-wrap; }
+  .pmt-empty { color: var(--pmt-text3); font-size: 13px; }
+  `;
+
+  // ---------- UI ----------
+  let busy = false;
+  let stopRequested = false;
+  let cache = null; // список промокодов
+
+  function el(html) { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstElementChild; }
+  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  function ensureStyle() {
+    if (document.getElementById('pmt-style')) return;
+    const s = document.createElement('style'); s.id = 'pmt-style'; s.textContent = STYLE; document.head.appendChild(s);
+  }
+
+  // Кнопка встаёт слева от «История изменений» в шапке страницы.
+  // Vue может перерисовать шапку и выкинуть её — поэтому проверяем регулярно.
+  function ensureButton() {
+    const mine = document.getElementById('pmt-open');
+    if (!onPromoPage()) { if (mine) mine.remove(); return; }
+    const history = [...document.querySelectorAll('.header-buttons button')]
+      .find((b) => b.textContent.trim() === 'История изменений');
+    if (!history) return;
+    if (mine && mine.nextElementSibling === history) return;
+    if (mine) mine.remove();
+    ensureStyle();
+    const b = el(`<button id="pmt-open" type="button" class="btn bg-grey bg-grey_border me-2">
+      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="me-2"><path d="M13 3l0 7l6 0l-8 11l0 -7l-6 0l8 -11"/></svg>
+      Массово промокоды</button>`);
+    b.addEventListener('click', openModal);
+    history.parentElement.insertBefore(b, history);
+  }
+
+  function openModal() {
+    ensureStyle();
+    if (document.getElementById('pmt-overlay')) return;
+    const ov = el(`
+      <div id="pmt-overlay">
+        <div id="pmt-modal">
+          <div id="pmt-header">
+            <h2>Промокоды — массовые действия <span style="color:var(--pmt-text3);font-weight:400">· ${esc(project())}</span></h2>
+            <button id="pmt-close" title="Закрыть">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 2l10 10M12 2L2 12"/></svg>
+            </button>
+          </div>
+          <div id="pmt-body">
+            <div class="pmt-stats" id="pmt-stats"><div class="pmt-empty">Загружаю список…</div></div>
+
+            <div class="pmt-card" id="pmt-run" style="display:none">
+              <div class="pmt-status" id="pmt-run-status"></div>
+              <div class="pmt-progress"><div id="pmt-bar"></div></div>
+              <div class="pmt-row"><button class="pmt-btn sm" id="pmt-stop">Остановить</button></div>
+              <div class="pmt-errors" id="pmt-errors"></div>
+            </div>
+
+            <div class="pmt-card">
+              <h3>Выключить все активные</h3>
+              <p>Отключит все промокоды со статусом «Активная». Список отключённых сохранится в лог (и скачается JSON-файлом на всякий случай).</p>
+              <div class="pmt-row"><button class="pmt-btn primary" id="pmt-disable-all">Выключить все активные</button></div>
+            </div>
+
+            <div class="pmt-card">
+              <h3>Включить обратно по логу</h3>
+              <p>Включит только промокоды из выбранного лога, которые сейчас неактивны. Архивные и уже активные пропускаются.</p>
+              <div class="pmt-logs" id="pmt-logs"></div>
+              <div class="pmt-row">
+                <button class="pmt-btn sm" id="pmt-import">Загрузить лог из файла</button>
+                <input type="file" id="pmt-file" accept=".json,application/json" style="display:none">
+              </div>
+            </div>
+
+            <div class="pmt-card">
+              <h3>Включить все неархивные</h3>
+              <p>Включит <b>все</b> неактивные неархивные промокоды, включая те, что были выключены вручную раньше. Использовать осторожно.</p>
+              <div class="pmt-row"><button class="pmt-btn danger" id="pmt-enable-all">Включить все неактивные</button></div>
+            </div>
+
+            <div class="pmt-row"><button class="pmt-btn sm" id="pmt-reload">Обновить страницу CRM</button></div>
+          </div>
+        </div>
+      </div>`);
+    document.body.appendChild(ov);
+
+    const close = () => { if (busy && !confirm('Операция ещё идёт. Закрыть окно? (она продолжится в фоне)')) return; ov.remove(); };
+    ov.querySelector('#pmt-close').addEventListener('click', close);
+    ov.addEventListener('mousedown', (e) => { if (e.target === ov) close(); });
+    ov.querySelector('#pmt-stop').addEventListener('click', () => { stopRequested = true; });
+    ov.querySelector('#pmt-disable-all').addEventListener('click', disableAll);
+    ov.querySelector('#pmt-enable-all').addEventListener('click', enableAllNotArchived);
+    ov.querySelector('#pmt-reload').addEventListener('click', () => location.reload());
+    ov.querySelector('#pmt-import').addEventListener('click', () => ov.querySelector('#pmt-file').click());
+    ov.querySelector('#pmt-file').addEventListener('change', importLog);
+
+    renderLogs();
+    refreshStats();
+  }
+
+  const $ = (sel) => document.querySelector(sel);
+
+  async function refreshStats() {
+    const box = $('#pmt-stats');
+    try {
+      cache = await fetchAll();
+      const c = { active: 0, not_active: 0, archived: 0 };
+      cache.forEach((x) => { c[x.status] = (c[x.status] || 0) + 1; });
+      if (box) box.innerHTML = `
+        <div class="pmt-stat"><b>${c.active}</b><span>Активные</span></div>
+        <div class="pmt-stat"><b>${c.not_active}</b><span>Неактивные</span></div>
+        <div class="pmt-stat"><b>${c.archived}</b><span>Архивные</span></div>`;
+    } catch (e) {
+      if (box) box.innerHTML = `<div class="pmt-errors">${esc(e.message)}</div>`;
+    }
+  }
+
+  function renderLogs() {
+    const box = $('#pmt-logs');
+    if (!box) return;
+    const logs = projectLogs();
+    if (!logs.length) { box.innerHTML = '<div class="pmt-empty">Логов для этого проекта пока нет.</div>'; return; }
+    box.innerHTML = '';
+    logs.forEach((log) => {
+      const row = el(`
+        <div class="pmt-log">
+          <div class="info">${fmtDate(log.ts)} — отключено ${log.items.length}
+            <small>${log.restoredTs ? 'Включено обратно ' + fmtDate(log.restoredTs) : 'Ещё не восстанавливался'}</small></div>
+          <button class="pmt-btn sm primary" data-a="restore">Включить</button>
+          <button class="pmt-btn sm" data-a="dl" title="Скачать JSON">⬇</button>
+          <button class="pmt-btn sm danger" data-a="del" title="Удалить лог">✕</button>
+        </div>`);
+      row.querySelector('[data-a=restore]').addEventListener('click', () => restoreFromLog(log));
+      row.querySelector('[data-a=dl]').addEventListener('click', () => downloadJson(log, `promocodes-${log.project}-${fileStamp(log.ts)}.json`));
+      row.querySelector('[data-a=del]').addEventListener('click', () => {
+        if (!confirm(`Удалить лог от ${fmtDate(log.ts)}? Восстановить по нему потом будет нельзя (если не скачан файл).`)) return;
+        saveLogs(loadLogs().filter((l) => l.id !== log.id));
+        renderLogs();
+      });
+      box.appendChild(row);
+    });
+  }
+
+  function importLog(e) {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    f.text().then((txt) => {
+      const log = JSON.parse(txt);
+      if (!log || !Array.isArray(log.items) || !log.ts) throw new Error('Это не лог скрипта');
+      if (log.project !== project() && !confirm(`Лог от проекта «${log.project}», а ты сейчас в «${project()}». Всё равно загрузить?`)) return;
+      log.project = project();
+      const logs = loadLogs().filter((l) => l.id !== log.id);
+      logs.push(log);
+      saveLogs(logs);
+      renderLogs();
+    }).catch((err) => alert('Не удалось загрузить лог: ' + err.message));
+  }
+
+  function setButtonsDisabled(v) {
+    document.querySelectorAll('#pmt-body .pmt-btn').forEach((b) => { if (b.id !== 'pmt-stop' && b.id !== 'pmt-reload') b.disabled = v; });
+  }
+
+  // Прогоняет список через PATCH с ограниченной параллельностью
+  async function runBatch(items, status, label, onOk) {
+    busy = true; stopRequested = false;
+    setButtonsDisabled(true);
+    const run = $('#pmt-run'); const bar = $('#pmt-bar'); const st = $('#pmt-run-status'); const errBox = $('#pmt-errors');
+    if (run) run.style.display = '';
+    if (errBox) errBox.textContent = '';
+    const ok = []; const failed = [];
+    let done = 0; let idx = 0;
+    const update = () => {
+      if (st) st.textContent = `${label}: ${done} из ${items.length} (ошибок: ${failed.length})${stopRequested ? ' — останавливаюсь…' : ''}`;
+      if (bar) bar.style.transform = `scaleX(${items.length ? done / items.length : 1})`;
+    };
+    update();
+    const worker = async () => {
+      while (idx < items.length && !stopRequested) {
+        const it = items[idx++];
+        try { await setStatus(it.id, status); ok.push(it); if (onOk) onOk(it); } catch (e) {
+          failed.push({ ...it, error: e.message });
+          if (errBox) errBox.textContent += `${it.code}: ${e.message}\n`;
+        }
+        done++; update();
+      }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+    if (st) st.textContent = `${label}: готово ${ok.length} из ${items.length}${failed.length ? `, ошибок ${failed.length}` : ''}${stopRequested ? ' (остановлено)' : ''}.`;
+    busy = false;
+    setButtonsDisabled(false);
+    return { ok, failed, stopped: stopRequested };
+  }
+
+  const brief = (x) => ({ id: x.id, code: x.code, name: x.name?.ru || '' });
+
+  async function disableAll() {
+    if (busy) return;
+    await refreshStats();
+    const targets = (cache || []).filter((x) => x.status === 'active').map(brief);
+    if (!targets.length) { alert('Активных промокодов нет.'); return; }
+    if (!confirm(`Выключить ${targets.length} активных промокодов в проекте «${project()}»?`)) return;
+
+    const ts = Date.now();
+    const log = { id: `${project()}-${ts}`, project: project(), ts, items: [], failed: [] };
+    const persist = () => { const logs = loadLogs().filter((l) => l.id !== log.id); logs.push(log); saveLogs(logs); };
+
+    // лог пишется после каждого успешного выключения — если вкладку закроют посреди процесса, ничего не потеряется
+    const res = await runBatch(targets, 'not_active', 'Выключение', (it) => { log.items.push(it); persist(); });
+    log.failed = res.failed;
+    if (log.items.length) {
+      persist();
+      downloadJson(log, `promocodes-${log.project}-${fileStamp(ts)}.json`);
+    }
+    renderLogs();
+    refreshStats();
+  }
+
+  async function restoreFromLog(log) {
+    if (busy) return;
+    await refreshStats();
+    const byId = new Map((cache || []).map((x) => [x.id, x]));
+    const targets = []; let skippedActive = 0; let skippedArchived = 0; let missing = 0;
+    log.items.forEach((it) => {
+      const cur = byId.get(it.id);
+      if (!cur) missing++;
+      else if (cur.status === 'active') skippedActive++;
+      else if (cur.status === 'archived') skippedArchived++;
+      else targets.push(brief(cur));
+    });
+    const notes = [skippedActive && `уже активны: ${skippedActive}`, skippedArchived && `в архиве: ${skippedArchived}`, missing && `не найдены: ${missing}`].filter(Boolean).join(', ');
+    if (!targets.length) { alert(`Включать нечего${notes ? ` (${notes})` : ''}.`); return; }
+    if (!confirm(`Включить ${targets.length} промокодов из лога от ${fmtDate(log.ts)}?${notes ? `\nПропущено — ${notes}.` : ''}`)) return;
+    const res = await runBatch(targets, 'active', 'Включение по логу');
+    if (!res.failed.length && !res.stopped) {
+      const logs = loadLogs();
+      const l = logs.find((x) => x.id === log.id);
+      if (l) { l.restoredTs = Date.now(); saveLogs(logs); }
+    }
+    renderLogs();
+    refreshStats();
+  }
+
+  async function enableAllNotArchived() {
+    if (busy) return;
+    await refreshStats();
+    const targets = (cache || []).filter((x) => x.status === 'not_active').map(brief);
+    if (!targets.length) { alert('Неактивных промокодов нет.'); return; }
+    if (!confirm(`Включить ВСЕ ${targets.length} неактивных промокодов в «${project()}»?\nСюда попадут и те, что были выключены вручную раньше, не этим скриптом.`)) return;
+    if (prompt(`Для подтверждения введи число промокодов (${targets.length}):`) !== String(targets.length)) return;
+    await runBatch(targets, 'active', 'Включение всех');
+    refreshStats();
+  }
+
+  // CRM — SPA: следим за сменой страницы и перерисовкой шапки
+  ensureButton();
+  setInterval(ensureButton, 700);
+})();
